@@ -219,7 +219,6 @@ static void do_set_node_link(set_meta_info *info,
 
         par_node->htab[par_hidx] = node;
         par_node->hcnt[par_hidx] = -1; /* child hash node */
-        par_node->tot_elem_cnt -= num_found;
         par_node->tot_hash_cnt += 1;
     }
 
@@ -263,12 +262,10 @@ static void do_set_node_unlink(set_meta_info *info,
                 assert(node->hcnt[hidx] == 0);
             }
         }
-        assert(fcnt == node->tot_elem_cnt);
         node->tot_elem_cnt = 0;
 
         par_node->htab[par_hidx] = head;
         par_node->hcnt[par_hidx] = fcnt;
-        par_node->tot_elem_cnt += fcnt;
         par_node->tot_hash_cnt -= 1;
     }
 
@@ -324,7 +321,14 @@ static ENGINE_ERROR_CODE do_set_elem_link(set_meta_info *info, set_elem_item *el
     elem->next = node->htab[hidx];
     node->htab[hidx] = elem;
     node->hcnt[hidx] += 1;
-    node->tot_elem_cnt += 1;
+    node = info->root;
+    while (node != NULL) {
+        node->tot_elem_cnt += 1;
+        hidx = SET_GET_HASHIDX(elem->hval, node->hdepth);
+        if (node->hcnt[hidx] >= 0)
+            break;
+        node = node->htab[hidx];
+    }
 
     info->ccnt++;
 
@@ -400,6 +404,7 @@ static ENGINE_ERROR_CODE do_set_elem_traverse_delete(set_meta_info *info, set_ha
                 child_node->tot_elem_cnt < (SET_MAX_HASHCHAIN_SIZE/2)) {
                 do_set_node_unlink(info, node, hidx);
             }
+            node->tot_elem_cnt--;
         }
     } else {
         ret = ENGINE_ELEM_ENOENT;
@@ -497,13 +502,15 @@ static int do_set_elem_traverse_dfs(set_meta_info *info, set_hash_node *node,
         if (node->hcnt[hidx] == -1) {
             set_hash_node *child_node = (set_hash_node *)node->htab[hidx];
             int rcnt = (count > 0 ? (count - fcnt) : 0);
-            fcnt += do_set_elem_traverse_dfs(info, child_node, rcnt, delete,
-                                            (elem_array==NULL ? NULL : &elem_array[fcnt]));
+            int ecnt = do_set_elem_traverse_dfs(info, child_node, rcnt, delete,
+                                                (elem_array==NULL ? NULL : &elem_array[fcnt]));
+            fcnt += ecnt;
             if (delete) {
                 if (child_node->tot_hash_cnt == 0 &&
                     child_node->tot_elem_cnt < (SET_MAX_HASHCHAIN_SIZE/2)) {
                     do_set_node_unlink(info, node, hidx);
                 }
+                node->tot_elem_cnt -= ecnt;
             }
         } else if (node->hcnt[hidx] > 0) {
             set_elem_item *elem = node->htab[hidx];
