@@ -31,6 +31,8 @@
 #define PERSISTENCE_ACTION_BEGIN(a, b)
 #define PERSISTENCE_ACTION_END(a)
 
+#define SOP_GET_MAGIC_MUL 100000
+
 #include "default_engine.h"
 #include "item_clog.h"
 
@@ -492,8 +494,8 @@ static uint32_t do_set_elem_traverse_fast(set_meta_info *info,
 #endif
 
 static int do_set_elem_traverse_dfs(set_meta_info *info, set_hash_node *node,
-                                    const uint32_t count, const bool delete,
-                                    set_elem_item **elem_array)
+                                    const uint32_t count, const uint32_t offset, const bool delete,
+                                    set_elem_item **elem_array, int *skip_cnt)
 {
     int hidx;
     int fcnt = 0; /* found count */
@@ -501,9 +503,13 @@ static int do_set_elem_traverse_dfs(set_meta_info *info, set_hash_node *node,
     for (hidx = 0; hidx < SET_HASHTAB_SIZE; hidx++) {
         if (node->hcnt[hidx] == -1) {
             set_hash_node *child_node = (set_hash_node *)node->htab[hidx];
+            if (offset && ((*skip_cnt + child_node->tot_elem_cnt - 1) < offset)) {
+                (*skip_cnt) += child_node->tot_elem_cnt;
+                continue;
+            }
             int rcnt = (count > 0 ? (count - fcnt) : 0);
-            int ecnt = do_set_elem_traverse_dfs(info, child_node, rcnt, delete,
-                                                (elem_array==NULL ? NULL : &elem_array[fcnt]));
+            int ecnt = do_set_elem_traverse_dfs(info, child_node, rcnt, offset, delete,
+                                                (elem_array==NULL ? NULL : &elem_array[fcnt]), skip_cnt);
             fcnt += ecnt;
             if (delete) {
                 if (child_node->tot_elem_cnt < (SET_MAX_HASHCHAIN_SIZE/2)
@@ -513,8 +519,17 @@ static int do_set_elem_traverse_dfs(set_meta_info *info, set_hash_node *node,
                 node->tot_elem_cnt -= ecnt;
             }
         } else if (node->hcnt[hidx] > 0) {
+            if (offset && ((*skip_cnt + node->hcnt[hidx] - 1) < offset)) {
+                (*skip_cnt) += node->hcnt[hidx];
+                continue;
+            }
             set_elem_item *elem = node->htab[hidx];
             while (elem != NULL) {
+                if (offset && (*skip_cnt < offset)) {
+                    (*skip_cnt) += 1;
+                    elem = (delete ? node->htab[hidx] : elem->next);
+                    continue;
+                }
                 if (elem_array) {
                     elem->refcount++;
                     elem_array[fcnt] = elem;
@@ -530,6 +545,37 @@ static int do_set_elem_traverse_dfs(set_meta_info *info, set_hash_node *node,
         if (count > 0 && fcnt >= count) break;
     }
     return fcnt;
+}
+static int do_set_elem_traverse_dfs_sampling(set_meta_info *info, set_hash_node *node,
+                                    const uint32_t count, const bool delete,
+                                    set_elem_item **elem_array, int *added, int *passed)
+{
+    int hidx;
+    for (hidx = 0; hidx < SET_HASHTAB_SIZE; hidx++) {
+        if (node->hcnt[hidx] == -1) {
+            set_hash_node *child_node = (set_hash_node *)node->htab[hidx];
+            do_set_elem_traverse_dfs_sampling(info, child_node, count, delete,
+                                              elem_array, added, passed);
+        } else if (node->hcnt[hidx] > 0) {
+            set_elem_item *elem = node->htab[hidx];
+            while (elem != NULL && *added < count) {
+                int needed = count - (*added);
+                int remaining = info->ccnt - (*passed);
+                double randomDouble = ((double)rand()) / RAND_MAX;
+                double threshold = ((double)needed) / remaining;
+                if (randomDouble <= threshold) {
+                    elem->refcount++;
+                    elem_array[*added] = elem;
+                    (*added) += 1;
+                }
+                (*passed) += 1;
+                if (*added >= count) break;
+                elem = elem->next;
+            }
+        }
+        if (*added >= count) break;
+    }
+    return *added;
 }
 
 #ifdef SET_DELETE_NO_MERGE
@@ -557,7 +603,7 @@ static uint32_t do_set_elem_delete(set_meta_info *info, const uint32_t count,
     assert(cause == ELEM_DELETE_COLL);
     uint32_t fcnt = 0;
     if (info->root != NULL) {
-        fcnt = do_set_elem_traverse_dfs(info, info->root, count, true, NULL);
+        fcnt = do_set_elem_traverse_dfs(info, info->root, count, 0, true, NULL, 0);
         if (info->root->tot_elem_cnt == 0) {
             do_set_node_unlink(info, NULL, 0);
         }
@@ -565,23 +611,178 @@ static uint32_t do_set_elem_delete(set_meta_info *info, const uint32_t count,
     return fcnt;
 }
 
+typedef struct hash_node {
+    int key;
+    struct hash_node *next;
+} hash_node;
+typedef struct hash_table {
+    hash_node **buckets;
+    int capacity;
+} hash_table;
+static void hash_init(hash_table *ht, int needed)
+{
+    ht->capacity = needed;
+    ht->buckets = (hash_node**)calloc(ht->capacity, sizeof(hash_node*));
+}
+static void hash_free(hash_table *ht)
+{
+    if (!ht->buckets) return;
+    for (int i = 0; i < ht->capacity; i++) {
+        hash_node *current = ht->buckets[i];
+        while (current) {
+            hash_node *tmp = current;
+            current = current->next;
+            free(tmp);
+        }
+    }
+    free(ht->buckets);
+    ht->buckets = NULL;
+    ht->capacity = 0;
+}
+static bool hash_insert(hash_table *ht, int key)
+{
+    size_t idx = key % ht->capacity;
+    hash_node *current = ht->buckets[idx];
+    while (current != NULL) {
+        if (current->key == key)
+            return false;
+        current = current->next;
+    }
+    hash_node *new_node = (hash_node*)malloc(sizeof(hash_node));
+    assert(new_node != NULL);
+    new_node->key  = key;
+    new_node->next = ht->buckets[idx];
+    ht->buckets[idx] = new_node;
+    return true;
+}
+const int prime_table[] =
+{
+    101, 307, 503, 701, 919, 1201, 1511,
+    2131, 3083, 5099, 7001, 10007, 12007,
+    15013, 20011, 30011, 40009, 50021
+};
+static int next_prime(int num)
+{
+    for (int i = 0; i < sizeof(prime_table) / sizeof(prime_table[0]); i++) {
+        if (prime_table[i] >= num) return prime_table[i];
+    }
+    return num;
+}
+
+typedef struct hash_node_new {
+    int cnt;
+    int keys[3];
+} hash_node_new;
+typedef struct hash_table_new {
+    hash_node_new *buckets;
+    int capacity;
+} hash_table_new;
+static void hash_init_new(hash_table_new *ht, int needed)
+{
+    ht->capacity = needed;
+    ht->buckets = (hash_node_new*)calloc(ht->capacity, sizeof(hash_node_new));
+}
+static void hash_free_new(hash_table_new *ht)
+{
+    if (!ht->buckets) return;
+    free(ht->buckets);
+    ht->buckets = NULL;
+    ht->capacity = 0;
+}
+static bool hash_insert_new(hash_table_new *ht, int key)
+{
+    size_t idx = (unsigned int)key % ht->capacity;
+    hash_node_new *bucket = &ht->buckets[idx];
+    if (bucket->cnt == 3) return false; // FULL
+    for(int i = 0; i < bucket->cnt; i++){
+        if(bucket->keys[i] == key) return false; // Duplicate
+    }
+    bucket->keys[bucket->cnt] = key;
+    bucket->cnt++;
+    return true;
+}
 static uint32_t do_set_elem_get(set_meta_info *info,
                                 const uint32_t count, const bool delete,
                                 set_elem_item **elem_array)
 {
     assert(info->root);
-    uint32_t fcnt;
+    uint32_t fcnt = 0;
+    int skip_cnt = 0;
+    int added = 0;
+
+    clock_t start_time, end_time;
+    double elapsed_time;
+    start_time = clock();
 
     if (delete) {
         CLOG_ELEM_DELETE_BEGIN((coll_meta_info*)info, count, ELEM_DELETE_NORMAL);
     }
-    fcnt = do_set_elem_traverse_dfs(info, info->root, count, delete, elem_array);
+    /* Return all */
+    if (count >= info->ccnt || count == 0) {
+    // if(1){
+        printf("1 : ");
+        fcnt = do_set_elem_traverse_dfs(info, info->root, count, 0, delete,
+                                        elem_array, &skip_cnt);
+    }
+    /* Deleting partial elements */
+    else if (delete) {
+        while (added < count) {
+            int rand_offset = (rand() % info->ccnt);
+            fcnt += do_set_elem_traverse_dfs(info, info->root, 1, rand_offset, delete,
+                                             &elem_array[added++], &skip_cnt);
+        }
+    }
+    /* Request count is large use sampling */
+    // else if (count * SOP_GET_MAGIC_MUL >= info->ccnt) {
+    else if(1){
+        int passed = 0;
+        fcnt = do_set_elem_traverse_dfs_sampling(info, info->root, count, delete,
+                                                 elem_array, &added, &passed);
+
+        printf("Adding to elem_array time: %f seconds\n", elapsed_func);
+    }
+    else if (1) {
+        printf("3 : ");
+        hash_table_new offset_ht;
+        int needed_capacity = next_prime((int)(1.3 * (double)count));
+        hash_init_new(&offset_ht, needed_capacity);
+        while (added < count) {
+            int rand_offset = (rand() % info->ccnt);
+            skip_cnt = 0;
+            if (hash_insert_new(&offset_ht, rand_offset)) {
+                fcnt += do_set_elem_traverse_dfs(info, info->root, 1, rand_offset, delete,
+                                                 &elem_array[added++], &skip_cnt);
+            }
+        }
+        hash_free_new(&offset_ht);
+    }
+    /* Request count is small use hash table */
+    else {
+        printf("4 : ");
+        hash_table offset_ht;
+        int needed_capacity = next_prime((int)(1.3 * (double)count));
+        hash_init(&offset_ht, needed_capacity);
+        while (added < count) {
+            int rand_offset = (rand() % info->ccnt);
+            skip_cnt = 0;
+            if (hash_insert(&offset_ht, rand_offset)) {
+                fcnt += do_set_elem_traverse_dfs(info, info->root, 1, rand_offset, delete,
+                                                 &elem_array[added++], &skip_cnt);
+            }
+        }
+        hash_free(&offset_ht);
+    }
     if (delete && info->root->tot_elem_cnt == 0) {
         do_set_node_unlink(info, NULL, 0);
     }
     if (delete) {
         CLOG_ELEM_DELETE_END((coll_meta_info*)info, ELEM_DELETE_NORMAL);
     }
+
+    end_time = clock();
+    elapsed_time = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+    printf("Elapsed time for random: %f seconds\n", elapsed_time);
+
     return fcnt;
 }
 

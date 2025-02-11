@@ -15170,6 +15170,8 @@ int main (int argc, char **argv)
         return EX_OSERR;
     }
 
+    srand(time(NULL));
+
     /* init settings */
     settings_init();
 
