@@ -53,6 +53,53 @@ static inline void UNLOCK_CACHE(void)
 }
 
 /*
+ * Hash table management
+ */
+const int prime_table[] =
+{
+    11, 23, 41, 83, 163,
+    211, 311, 401, 509, 601,
+    701, 809, 907, 1087, 1301
+};
+inline static int next_prime(int num)
+{
+    for (int i = 0; i < sizeof(prime_table) / sizeof(prime_table[0]); i++) {
+        if (prime_table[i] >= num)
+            return prime_table[i];
+    }
+    return num;
+}
+static bool hash_init(hash_table *ht, int count)
+{
+    ht->capacity = next_prime((int)(1.3 * (double)count));
+    ht->buckets = (hash_node*)calloc(ht->capacity, sizeof(hash_node));
+    if (ht->buckets == NULL) return false;
+    return true;
+}
+static void hash_free(hash_table *ht)
+{
+    if (!ht->buckets)
+        return;
+    free(ht->buckets);
+    ht->buckets = NULL;
+    ht->capacity = 0;
+}
+static bool hash_insert(hash_table *ht, int key)
+{
+    size_t idx = key % ht->capacity;
+    hash_node *bucket = &ht->buckets[idx];
+    if (bucket->cnt == 3)
+        return false;
+    for (int i = 0; i < bucket->cnt; i++) {
+        if (bucket->keys[i] == key)
+            return false;
+    }
+    bucket->keys[bucket->cnt] = key;
+    bucket->cnt++;
+    return true;
+}
+
+/*
  * SET collection manangement
  */
 //#define SET_DELETE_NO_MERGE
@@ -492,17 +539,22 @@ static uint32_t do_set_elem_traverse_fast(set_meta_info *info,
 #endif
 
 static int do_set_elem_traverse_dfs(set_meta_info *info, set_hash_node *node,
-                                    const uint32_t count, const bool delete,
-                                    set_elem_item **elem_array)
+                                    const uint32_t count, uint32_t offset,
+                                    const bool delete, set_elem_item **elem_array)
 {
+    assert(count == 1 || offset == 0 || !delete);
     int hidx;
     int fcnt = 0; /* found count */
 
     for (hidx = 0; hidx < SET_HASHTAB_SIZE; hidx++) {
         if (node->hcnt[hidx] == -1) {
             set_hash_node *child_node = (set_hash_node *)node->htab[hidx];
+            if (offset >= child_node->tot_elem_cnt) {
+                offset -= child_node->tot_elem_cnt;
+                continue;
+            }
             int rcnt = (count > 0 ? (count - fcnt) : 0);
-            int ecnt = do_set_elem_traverse_dfs(info, child_node, rcnt, delete,
+            int ecnt = do_set_elem_traverse_dfs(info, child_node, rcnt, offset, delete,
                                                 (elem_array==NULL ? NULL : &elem_array[fcnt]));
             fcnt += ecnt;
             if (delete) {
@@ -513,14 +565,25 @@ static int do_set_elem_traverse_dfs(set_meta_info *info, set_hash_node *node,
                 node->tot_elem_cnt -= ecnt;
             }
         } else if (node->hcnt[hidx] > 0) {
+            if (offset >= node->hcnt[hidx]) {
+                offset -= node->hcnt[hidx];
+                continue;
+            }
             set_elem_item *elem = node->htab[hidx];
+            set_elem_item *prev = NULL;
             while (elem != NULL) {
+                if (offset > 0) {
+                    offset -= 1;
+                    prev = elem;
+                    elem = elem->next;
+                    continue;
+                }
                 if (elem_array) {
                     elem->refcount++;
                     elem_array[fcnt] = elem;
                 }
                 fcnt++;
-                if (delete) do_set_elem_unlink(info, node, hidx, NULL, elem,
+                if (delete) do_set_elem_unlink(info, node, hidx, prev, elem,
                                                (elem_array==NULL ? ELEM_DELETE_COLL
                                                                  : ELEM_DELETE_NORMAL));
                 if (count > 0 && fcnt >= count) break;
@@ -557,7 +620,7 @@ static uint32_t do_set_elem_delete(set_meta_info *info, const uint32_t count,
     assert(cause == ELEM_DELETE_COLL);
     uint32_t fcnt = 0;
     if (info->root != NULL) {
-        fcnt = do_set_elem_traverse_dfs(info, info->root, count, true, NULL);
+        fcnt = do_set_elem_traverse_dfs(info, info->root, count, 0, true, NULL);
         if (info->root->tot_elem_cnt == 0) {
             do_set_node_unlink(info, NULL, 0);
         }
@@ -570,12 +633,38 @@ static uint32_t do_set_elem_get(set_meta_info *info,
                                 set_elem_item **elem_array)
 {
     assert(info->root);
-    uint32_t fcnt;
+    uint32_t fcnt = 0;
 
     if (delete) {
         CLOG_ELEM_DELETE_BEGIN((coll_meta_info*)info, count, ELEM_DELETE_NORMAL);
     }
-    fcnt = do_set_elem_traverse_dfs(info, info->root, count, delete, elem_array);
+    /* Return all */
+    if (count >= info->ccnt || count == 0) {
+        fcnt = do_set_elem_traverse_dfs(info, info->root, count, 0, delete,
+                                        elem_array);
+    }
+    /* Deleting partial elements */
+    else if (delete) {
+        while (fcnt < count) {
+            int rand_offset = (rand() % info->ccnt);
+            fcnt += do_set_elem_traverse_dfs(info, info->root, 1, rand_offset, delete,
+                                             &elem_array[fcnt]);
+        }
+    }
+    /* Use hash table */
+    else {
+        hash_table offset_ht;
+        if(!hash_init(&offset_ht, count))
+            return 0;
+        while (fcnt < count) {
+            int rand_offset = (rand() % info->ccnt);
+            if (hash_insert(&offset_ht, rand_offset)) {
+                fcnt += do_set_elem_traverse_dfs(info, info->root, 1, rand_offset, delete,
+                                                 &elem_array[fcnt]);
+            }
+        }
+        hash_free(&offset_ht);
+    }
     if (delete && info->root->tot_elem_cnt == 0) {
         do_set_node_unlink(info, NULL, 0);
     }
@@ -821,6 +910,11 @@ ENGINE_ERROR_CODE set_elem_get(const char *key, const uint32_t nkey,
             }
             eresult->elem_count = do_set_elem_get(info, count, delete,
                                                   (set_elem_item**)(eresult->elem_array));
+            if (eresult->elem_count == 0) {
+                free(eresult->elem_array);
+                ret = ENGINE_ENOMEM;
+                break;
+            }
             assert(eresult->elem_count > 0);
             if (info->ccnt == 0 && drop_if_empty) {
                 assert(delete == true);

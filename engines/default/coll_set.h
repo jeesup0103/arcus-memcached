@@ -74,4 +74,13 @@ ENGINE_ERROR_CODE set_apply_elem_delete(void *engine, hash_item *it,
 ENGINE_ERROR_CODE item_set_coll_init(void *engine_ptr);
 void item_set_coll_final(void *engine_ptr);
 
+typedef struct hash_node {
+    int cnt;
+    int keys[3];
+} hash_node;
+typedef struct hash_table {
+    hash_node *buckets;
+    int capacity;
+} hash_table;
+
 #endif
